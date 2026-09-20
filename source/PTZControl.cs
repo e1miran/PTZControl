@@ -94,15 +94,27 @@ namespace PTZControl
     [ComImport, Guid("62BE5D10-60EB-11d0-BD3B-00A0C911CE86")]
     internal class SystemDeviceEnum { }
 
-    [ComImport, Guid("55272A00-42CB-11CE-8135-00AA004BB851"), InterfaceType(ComInterfaceType.InterfaceIsDual)]
+    // IPropertyBag inherits from IUnknown only (NOT IDispatch) - it is a
+    // plain COM interface, not a dual interface. Declaring it as
+    // InterfaceIsDual (as an earlier version of this file did) makes .NET
+    // reserve 4 extra vtable slots for IDispatch's methods that don't
+    // actually exist on this interface, so every call to Read()/Write() ends
+    // up invoking whatever real method happens to sit 4 slots further down
+    // the object's actual vtable - a wrong-method call with a mismatched
+    // argument list, which corrupts the stack. This is what was causing the
+    // STATUS_STACK_BUFFER_OVERRUN (0xc0000409) crash in ucrtbase.dll: it only
+    // shows up as a visible crash depending on what code happens to occupy
+    // that wrong slot for a given camera driver, which is why it appeared
+    // "random" across different machines.
+    [ComImport, Guid("55272A00-42CB-11CE-8135-00AA004BB851"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
     internal interface IPropertyBag
     {
-        [return: MarshalAs(UnmanagedType.I4)]
+        [PreserveSig]
         int Read([MarshalAs(UnmanagedType.LPWStr)] string pszPropName,
                   [MarshalAs(UnmanagedType.Struct)] ref object pVar,
                   IntPtr pErrorLog);
 
-        [return: MarshalAs(UnmanagedType.I4)]
+        [PreserveSig]
         int Write([MarshalAs(UnmanagedType.LPWStr)] string pszPropName,
                    [MarshalAs(UnmanagedType.Struct)] ref object pVar);
     }
