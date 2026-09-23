@@ -492,18 +492,18 @@ namespace PTZControl
             if (rangeHr != 0)
                 throw new Exception(prop + " is not supported on this device.");
 
-            if ((prop == CameraControlProperty.Pan || prop == CameraControlProperty.Tilt) && min == max)
+            if (min == max)
             {
                 message = string.Format("{0} has no range to move in right now (at min/max zoom crop) - doing nothing.", prop);
                 return;
             }
 
-            int clamped = Clamp(value, min, max);
-            int hr = cc.Set(prop, clamped, CameraControlFlags.Manual);
+            int snapped = ClampAndSnap(value, min, max, step);
+            int hr = cc.Set(prop, snapped, CameraControlFlags.Manual);
             if (hr != 0)
                 throw new Exception(string.Format("Set failed (hr=0x{0:X8}).", hr));
 
-            message = string.Format("{0} = {1} (requested {2}, range [{3},{4}])", prop, clamped, value, min, max);
+            message = string.Format("{0} = {1} (requested {2}, range [{3},{4}])", prop, snapped, value, min, max);
         }
 
         public static void MoveRelative(int deviceIndex, CameraControlProperty prop, int delta, out string message)
@@ -535,7 +535,11 @@ namespace PTZControl
 
             int current = ReadValue(cc, prop);
 
-            int target = Clamp(current + delta, min, max);
+            // Compute in long to avoid unchecked overflow on current + delta,
+            // clamp to the property's range, then snap to the driver's step grid.
+            long targetLong = (long)current + delta;
+            int target = ClampAndSnap(targetLong < min ? min : targetLong > max ? max : (int)targetLong, min, max, step);
+
             int hr = cc.Set(prop, target, CameraControlFlags.Manual);
             if (hr != 0)
                 throw new Exception(string.Format("Set failed (hr=0x{0:X8}).", hr));
@@ -668,6 +672,18 @@ namespace PTZControl
             if (v < min) return min;
             if (v > max) return max;
             return v;
+        }
+
+        // Clamps to [min,max] and snaps to the driver's step grid (steppingDelta),
+        // anchored at the range minimum, so Set() doesn't fail with E_INVALIDARG
+        // when the value isn't a multiple of the camera's step size.
+        public static int ClampAndSnap(int v, int min, int max, int step)
+        {
+            int clamped = Clamp(v, min, max);
+            if (step <= 1)
+                return clamped;
+            int snapped = clamped - ((clamped - min) % step);
+            return Clamp(snapped, min, max);
         }
 
         public static CameraControlProperty ParseProperty(string s)
