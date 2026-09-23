@@ -345,15 +345,25 @@ namespace PTZControl
             try
             {
                 Guid propertyBagGuid = typeof(IPropertyBag).GUID;
-                moniker.BindToStorage(null, null, ref propertyBagGuid, out bagObj);
-                var bag = (IPropertyBag)bagObj;
+                try
+                {
+                    moniker.BindToStorage(null, null, ref propertyBagGuid, out bagObj);
+                }
+                catch (COMException)
+                {
+                    return "(unknown)";
+                }
+
+                var bag = bagObj as IPropertyBag;
+                if (bag == null)
+                    return "(unknown)";
+
                 object val = null;
-                bag.Read("FriendlyName", ref val, IntPtr.Zero);
-                return val != null ? val.ToString() : "(unknown)";
-            }
-            catch
-            {
-                return "(unknown)";
+                int readHr = bag.Read("FriendlyName", ref val, IntPtr.Zero);
+                if (readHr != 0 || val == null)
+                    return "(unknown)";
+
+                return val.ToString();
             }
             finally
             {
@@ -449,7 +459,12 @@ namespace PTZControl
                     continue;
                 }
                 int value; CameraControlFlags flags;
-                cc.Get(prop, out value, out flags);
+                int getHr = cc.Get(prop, out value, out flags);
+                if (getHr != 0)
+                {
+                    sb.AppendLine(string.Format("  {0,-9} read failed (hr=0x{1:X8})", prop, getHr));
+                    continue;
+                }
                 sb.AppendLine(string.Format("  {0,-9} value={1,-6} range=[{2},{3}] step={4} default={5}",
                     prop, value, min, max, step, def));
             }
@@ -518,8 +533,7 @@ namespace PTZControl
                 return;
             }
 
-            int current; CameraControlFlags flags;
-            cc.Get(prop, out current, out flags);
+            int current = ReadValue(cc, prop);
 
             int target = Clamp(current + delta, min, max);
             int hr = cc.Set(prop, target, CameraControlFlags.Manual);
@@ -573,18 +587,26 @@ namespace PTZControl
 
         internal static void SavePresetCore(IAMCameraControl cc, int slot, out string message)
         {
-            int pan; CameraControlFlags f;
-            cc.Get(CameraControlProperty.Pan, out pan, out f);
-            int tilt;
-            cc.Get(CameraControlProperty.Tilt, out tilt, out f);
-            int zoom;
-            cc.Get(CameraControlProperty.Zoom, out zoom, out f);
+            int pan = ReadValue(cc, CameraControlProperty.Pan);
+            int tilt = ReadValue(cc, CameraControlProperty.Tilt);
+            int zoom = ReadValue(cc, CameraControlProperty.Zoom);
 
             var presets = PresetStore.Load();
             presets[slot] = new Preset { Pan = pan, Tilt = tilt, Zoom = zoom };
             PresetStore.Save(presets);
 
             message = string.Format("Saved preset F{0}: pan={1}, tilt={2}, zoom={3}", slot, pan, tilt, zoom);
+        }
+
+        // Reads a property value, throwing on failure instead of returning a
+        // garbage 0 that would silently corrupt a saved preset.
+        static int ReadValue(IAMCameraControl cc, CameraControlProperty prop)
+        {
+            int value; CameraControlFlags flags;
+            int hr = cc.Get(prop, out value, out flags);
+            if (hr != 0)
+                throw new Exception(string.Format("Get {0} failed (hr=0x{1:X8}).", prop, hr));
+            return value;
         }
 
         public static void RecallPreset(int deviceIndex, int slot, out string message)
