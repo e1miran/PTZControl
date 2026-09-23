@@ -382,7 +382,15 @@ namespace PTZControl
 
                 var camControl = filterObj as IAMCameraControl;
                 if (camControl == null)
+                {
+                    // No PTZ interface on this filter; release the filter we
+                    // just bound instead of leaking it.
+                    if (Marshal.IsComObject(filterObj))
+                    {
+                        try { Marshal.ReleaseComObject(filterObj); } catch { }
+                    }
                     throw new Exception(string.Format("Device '{0}' does not support IAMCameraControl (no PTZ controls).", dev.Name));
+                }
 
                 // The QI above normally returns the SAME RCW that BindToObject
                 // created, so releasing filterObj here would free the object out
@@ -397,12 +405,20 @@ namespace PTZControl
             {
                 // Monikers have served their purpose (binding the selected
                 // device); release them all instead of leaving them to the GC.
-                foreach (DeviceInfo d in devices)
+                ReleaseDevices(devices);
+            }
+        }
+
+        // Releases every moniker in an enumeration result. Monikers are only
+        // needed transiently (to bind a device); call this once you're done with
+        // the DeviceInfo array so they don't fall to the GC finalizer.
+        public static void ReleaseDevices(DeviceInfo[] devices)
+        {
+            foreach (DeviceInfo d in devices)
+            {
+                if (d.Moniker != null && Marshal.IsComObject(d.Moniker))
                 {
-                    if (d.Moniker != null && Marshal.IsComObject(d.Moniker))
-                    {
-                        try { Marshal.ReleaseComObject(d.Moniker); } catch { }
-                    }
+                    try { Marshal.ReleaseComObject(d.Moniker); } catch { }
                 }
             }
         }
@@ -656,16 +672,21 @@ namespace PTZControl
             return v;
         }
 
-        // Clamps to [min,max] and snaps to the driver's step grid (steppingDelta),
-        // anchored at the range minimum, so Set() doesn't fail with E_INVALIDARG
-        // when the value isn't a multiple of the camera's step size.
+        // Clamps to [min,max] and rounds to the nearest point on the driver's
+        // step grid (steppingDelta), anchored at the range minimum, so Set()
+        // doesn't fail with E_INVALIDARG. Rounding to nearest (rather than
+        // flooring) keeps a relative move from silently collapsing to zero when
+        // the configured step isn't an exact multiple of the driver's step.
         public static int ClampAndSnap(int v, int min, int max, int step)
         {
             int clamped = Clamp(v, min, max);
             if (step <= 1)
                 return clamped;
-            int snapped = clamped - ((clamped - min) % step);
-            return Clamp(snapped, min, max);
+            long offset = (long)clamped - min;               // >= 0, computed in long to avoid overflow
+            long rounded = ((offset + step / 2) / step) * step;
+            long snapped = min + rounded;                    // within [min, max + step)
+            if (snapped > max) snapped = max;
+            return (int)snapped;
         }
 
         public static CameraControlProperty ParseProperty(string s)
@@ -1146,13 +1167,20 @@ namespace PTZControl
         static IEnumerable<string> ListLines()
         {
             DeviceInfo[] devices = Camera.EnumerateDevices();
-            if (devices.Length == 0)
+            try
             {
-                yield return "No video capture devices found.";
-                yield break;
+                if (devices.Length == 0)
+                {
+                    yield return "No video capture devices found.";
+                    yield break;
+                }
+                for (int i = 0; i < devices.Length; i++)
+                    yield return i + ": " + devices[i].Name;
             }
-            for (int i = 0; i < devices.Length; i++)
-                yield return i + ": " + devices[i].Name;
+            finally
+            {
+                Camera.ReleaseDevices(devices);
+            }
         }
 
         static void PrintUsage()
