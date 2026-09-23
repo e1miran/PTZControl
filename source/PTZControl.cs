@@ -171,21 +171,16 @@ namespace PTZControl
 
     internal static class PresetStore
     {
-        static string FilePath()
-        {
-            string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "PTZControl");
-            Directory.CreateDirectory(dir);
-            return Path.Combine(dir, "presets.ini");
-        }
+        static readonly string Dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "PTZControl");
+        static readonly string PresetFile = Path.Combine(Dir, "presets.ini");
 
         public static Dictionary<int, Preset> Load()
         {
             var result = new Dictionary<int, Preset>();
-            string path = FilePath();
-            if (!File.Exists(path))
+            if (!File.Exists(PresetFile))
                 return result;
 
-            foreach (string rawLine in File.ReadAllLines(path))
+            foreach (string rawLine in File.ReadAllLines(PresetFile))
             {
                 string line = rawLine.Trim();
                 if (line.Length == 0 || line.StartsWith("#"))
@@ -221,11 +216,11 @@ namespace PTZControl
 
         public static void Save(Dictionary<int, Preset> presets)
         {
-            string path = FilePath();
+            Directory.CreateDirectory(Dir);
             var lines = new List<string> { "# PTZControl presets - auto-generated, F<slot>=pan,tilt,zoom" };
             foreach (var kv in presets.OrderBy(k => k.Key))
                 lines.Add(string.Format(CultureInfo.InvariantCulture, "F{0}={1},{2},{3}", kv.Key, kv.Value.Pan, kv.Value.Tilt, kv.Value.Zoom));
-            File.WriteAllLines(path, lines);
+            File.WriteAllLines(PresetFile, lines);
         }
     }
 
@@ -240,21 +235,16 @@ namespace PTZControl
 
     internal static class ConfigStore
     {
-        static string FilePath()
-        {
-            string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "PTZControl");
-            Directory.CreateDirectory(dir);
-            return Path.Combine(dir, "config.ini");
-        }
+        static readonly string Dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "PTZControl");
+        static readonly string ConfigFile = Path.Combine(Dir, "config.ini");
 
         public static HotkeyConfig LoadOrDefault()
         {
             var cfg = new HotkeyConfig { DeviceIndex = 0, PanStep = 1, TiltStep = 1, ZoomStep = 10 };
-            string path = FilePath();
-            if (!File.Exists(path))
+            if (!File.Exists(ConfigFile))
                 return cfg;
 
-            foreach (string rawLine in File.ReadAllLines(path))
+            foreach (string rawLine in File.ReadAllLines(ConfigFile))
             {
                 string line = rawLine.Trim();
                 if (line.Length == 0 || line.StartsWith("#"))
@@ -280,7 +270,7 @@ namespace PTZControl
 
         public static void Save(HotkeyConfig cfg)
         {
-            string path = FilePath();
+            Directory.CreateDirectory(Dir);
             var lines = new List<string>
             {
                 "# PTZControl hotkey config - auto-generated",
@@ -289,7 +279,7 @@ namespace PTZControl
                 "TiltStep=" + cfg.TiltStep.ToString(CultureInfo.InvariantCulture),
                 "ZoomStep=" + cfg.ZoomStep.ToString(CultureInfo.InvariantCulture)
             };
-            File.WriteAllLines(path, lines);
+            File.WriteAllLines(ConfigFile, lines);
         }
     }
 
@@ -627,7 +617,7 @@ namespace PTZControl
             IAMCameraControl cc = OpenCameraControl(deviceIndex, out unusedName);
             try
             {
-                RecallPresetCore(cc, slot, out message);
+                RecallPresetCore(cc, p, slot, out message);
             }
             finally
             {
@@ -635,16 +625,8 @@ namespace PTZControl
             }
         }
 
-        internal static void RecallPresetCore(IAMCameraControl cc, int slot, out string message)
+        internal static void RecallPresetCore(IAMCameraControl cc, Preset p, int slot, out string message)
         {
-            var presets = PresetStore.Load();
-            Preset p;
-            if (!presets.TryGetValue(slot, out p))
-            {
-                message = string.Format("No preset saved on F{0}.", slot);
-                return;
-            }
-
             // Set zoom first so pan/tilt are applied against the crop range
             // that matches the target zoom level.
             string zMsg, pMsg, tMsg;
@@ -756,7 +738,14 @@ namespace PTZControl
 
         public void RecallPreset(int slot, out string message)
         {
-            Camera.RecallPresetCore(cc, slot, out message);
+            var presets = PresetStore.Load();
+            Preset p;
+            if (!presets.TryGetValue(slot, out p))
+            {
+                message = string.Format("No preset saved on F{0}.", slot);
+                return;
+            }
+            Camera.RecallPresetCore(cc, p, slot, out message);
         }
 
         public void Dispose()
