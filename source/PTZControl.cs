@@ -304,57 +304,107 @@ namespace PTZControl
         public static DeviceInfo[] EnumerateDevices()
         {
             var devEnum = (ICreateDevEnum)new SystemDeviceEnum();
-            Guid category = CLSID_VideoInputDeviceCategory;
-            IEnumMoniker enumMoniker;
-            int hr = devEnum.CreateClassEnumerator(ref category, out enumMoniker, 0);
-            if (hr != 0 || enumMoniker == null)
-                return new DeviceInfo[0];
-
-            var result = new List<DeviceInfo>();
-            IMoniker[] monikers = new IMoniker[1];
-            IntPtr fetched = IntPtr.Zero;
-
-            while (enumMoniker.Next(1, monikers, fetched) == 0)
+            IEnumMoniker enumMoniker = null;
+            try
             {
-                IMoniker m = monikers[0];
-                string name = "(unknown)";
-                try
+                Guid category = CLSID_VideoInputDeviceCategory;
+                int hr = devEnum.CreateClassEnumerator(ref category, out enumMoniker, 0);
+                if (hr != 0 || enumMoniker == null)
+                    return new DeviceInfo[0];
+
+                var result = new List<DeviceInfo>();
+                IMoniker[] monikers = new IMoniker[1];
+                IntPtr fetched = IntPtr.Zero;
+
+                while (enumMoniker.Next(1, monikers, fetched) == 0)
                 {
-                    Guid propertyBagGuid = typeof(IPropertyBag).GUID;
-                    object bagObj;
-                    m.BindToStorage(null, null, ref propertyBagGuid, out bagObj);
-                    var bag = (IPropertyBag)bagObj;
-                    object val = null;
-                    bag.Read("FriendlyName", ref val, IntPtr.Zero);
-                    if (val != null) name = val.ToString();
+                    result.Add(new DeviceInfo { Moniker = monikers[0], Name = GetFriendlyName(monikers[0]) });
                 }
-                catch { }
 
-                result.Add(new DeviceInfo { Moniker = m, Name = name });
+                return result.ToArray();
             }
+            finally
+            {
+                if (enumMoniker != null && Marshal.IsComObject(enumMoniker))
+                {
+                    try { Marshal.ReleaseComObject(enumMoniker); } catch { }
+                }
+                if (Marshal.IsComObject(devEnum))
+                {
+                    try { Marshal.ReleaseComObject(devEnum); } catch { }
+                }
+            }
+        }
 
-            return result.ToArray();
+        // Reads the device's FriendlyName from its property bag, releasing the
+        // bag explicitly so it doesn't fall to the GC finalizer (unsafe with
+        // some camera drivers - see CloseCameraControl below).
+        static string GetFriendlyName(IMoniker moniker)
+        {
+            object bagObj = null;
+            try
+            {
+                Guid propertyBagGuid = typeof(IPropertyBag).GUID;
+                moniker.BindToStorage(null, null, ref propertyBagGuid, out bagObj);
+                var bag = (IPropertyBag)bagObj;
+                object val = null;
+                bag.Read("FriendlyName", ref val, IntPtr.Zero);
+                return val != null ? val.ToString() : "(unknown)";
+            }
+            catch
+            {
+                return "(unknown)";
+            }
+            finally
+            {
+                if (bagObj != null && Marshal.IsComObject(bagObj))
+                {
+                    try { Marshal.ReleaseComObject(bagObj); } catch { }
+                }
+            }
         }
 
         public static IAMCameraControl OpenCameraControl(int deviceIndex, out string deviceName)
         {
             DeviceInfo[] devices = EnumerateDevices();
-            if (deviceIndex < 0 || deviceIndex >= devices.Length)
-                throw new Exception(string.Format("Device index {0} out of range (found {1} device(s); run 'list').",
-                    deviceIndex, devices.Length));
+            try
+            {
+                if (deviceIndex < 0 || deviceIndex >= devices.Length)
+                    throw new Exception(string.Format("Device index {0} out of range (found {1} device(s); run 'list').",
+                        deviceIndex, devices.Length));
 
-            DeviceInfo dev = devices[deviceIndex];
-            deviceName = dev.Name;
+                DeviceInfo dev = devices[deviceIndex];
+                deviceName = dev.Name;
 
-            Guid iid = typeof(IBaseFilterMarker).GUID;
-            object filterObj;
-            dev.Moniker.BindToObject(null, null, ref iid, out filterObj);
+                Guid iid = typeof(IBaseFilterMarker).GUID;
+                object filterObj;
+                dev.Moniker.BindToObject(null, null, ref iid, out filterObj);
 
-            var camControl = filterObj as IAMCameraControl;
-            if (camControl == null)
-                throw new Exception(string.Format("Device '{0}' does not support IAMCameraControl (no PTZ controls).", dev.Name));
+                var camControl = filterObj as IAMCameraControl;
 
-            return camControl;
+                // BindToObject and the QI above each AddRef the filter. Release
+                // the IBaseFilter RCW so only the IAMCameraControl RCW (returned
+                // here, released by CloseCameraControl) keeps it alive.
+                if (filterObj != null && Marshal.IsComObject(filterObj))
+                    Marshal.ReleaseComObject(filterObj);
+
+                if (camControl == null)
+                    throw new Exception(string.Format("Device '{0}' does not support IAMCameraControl (no PTZ controls).", dev.Name));
+
+                return camControl;
+            }
+            finally
+            {
+                // Monikers have served their purpose (binding the selected
+                // device); release them all instead of leaving them to the GC.
+                foreach (DeviceInfo d in devices)
+                {
+                    if (d.Moniker != null && Marshal.IsComObject(d.Moniker))
+                    {
+                        try { Marshal.ReleaseComObject(d.Moniker); } catch { }
+                    }
+                }
+            }
         }
 
         // Releases a COM camera control connection obtained from OpenCameraControl.
@@ -704,6 +754,7 @@ namespace PTZControl
         readonly int panStep, tiltStep, zoomStep;
         readonly Dictionary<int, Action> handlers = new Dictionary<int, Action>();
         NotifyIcon trayIcon;
+        Icon ownTrayIcon; // set only when we extracted (and therefore own) the icon; SystemIcons.Application is shared and must not be disposed
         CameraSession session; // one persistent COM connection, reused for every hotkey
         int nextId = 1;
         string discardMsg; // scratch var for out params we don't need the value of
@@ -757,7 +808,9 @@ namespace PTZControl
             try
             {
                 trayIconImage = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
-                if (trayIconImage == null)
+                if (trayIconImage != null)
+                    ownTrayIcon = trayIconImage; // we own this one; dispose it on close
+                else
                     trayIconImage = SystemIcons.Application;
             }
             catch
@@ -863,6 +916,11 @@ namespace PTZControl
             {
                 trayIcon.Visible = false;
                 trayIcon.Dispose();
+            }
+            if (ownTrayIcon != null)
+            {
+                ownTrayIcon.Dispose();
+                ownTrayIcon = null;
             }
             if (session != null)
             {
