@@ -381,15 +381,15 @@ namespace PTZControl
                 dev.Moniker.BindToObject(null, null, ref iid, out filterObj);
 
                 var camControl = filterObj as IAMCameraControl;
-
-                // BindToObject and the QI above each AddRef the filter. Release
-                // the IBaseFilter RCW so only the IAMCameraControl RCW (returned
-                // here, released by CloseCameraControl) keeps it alive.
-                if (filterObj != null && Marshal.IsComObject(filterObj))
-                    Marshal.ReleaseComObject(filterObj);
-
                 if (camControl == null)
                     throw new Exception(string.Format("Device '{0}' does not support IAMCameraControl (no PTZ controls).", dev.Name));
+
+                // The QI above normally returns the SAME RCW that BindToObject
+                // created, so releasing filterObj here would free the object out
+                // from under camControl. Only release it when the QI produced a
+                // genuinely distinct RCW (which would otherwise leak).
+                if (!object.ReferenceEquals(filterObj, camControl) && Marshal.IsComObject(filterObj))
+                    Marshal.ReleaseComObject(filterObj);
 
                 return camControl;
             }
