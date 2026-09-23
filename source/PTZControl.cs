@@ -171,21 +171,16 @@ namespace PTZControl
 
     internal static class PresetStore
     {
-        static string FilePath()
-        {
-            string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "PTZControl");
-            Directory.CreateDirectory(dir);
-            return Path.Combine(dir, "presets.ini");
-        }
+        static readonly string Dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "PTZControl");
+        static readonly string PresetFile = Path.Combine(Dir, "presets.ini");
 
         public static Dictionary<int, Preset> Load()
         {
             var result = new Dictionary<int, Preset>();
-            string path = FilePath();
-            if (!File.Exists(path))
+            if (!File.Exists(PresetFile))
                 return result;
 
-            foreach (string rawLine in File.ReadAllLines(path))
+            foreach (string rawLine in File.ReadAllLines(PresetFile))
             {
                 string line = rawLine.Trim();
                 if (line.Length == 0 || line.StartsWith("#"))
@@ -221,11 +216,11 @@ namespace PTZControl
 
         public static void Save(Dictionary<int, Preset> presets)
         {
-            string path = FilePath();
+            Directory.CreateDirectory(Dir);
             var lines = new List<string> { "# PTZControl presets - auto-generated, F<slot>=pan,tilt,zoom" };
             foreach (var kv in presets.OrderBy(k => k.Key))
                 lines.Add(string.Format(CultureInfo.InvariantCulture, "F{0}={1},{2},{3}", kv.Key, kv.Value.Pan, kv.Value.Tilt, kv.Value.Zoom));
-            File.WriteAllLines(path, lines);
+            File.WriteAllLines(PresetFile, lines);
         }
     }
 
@@ -240,21 +235,16 @@ namespace PTZControl
 
     internal static class ConfigStore
     {
-        static string FilePath()
-        {
-            string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "PTZControl");
-            Directory.CreateDirectory(dir);
-            return Path.Combine(dir, "config.ini");
-        }
+        static readonly string Dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "PTZControl");
+        static readonly string ConfigFile = Path.Combine(Dir, "config.ini");
 
         public static HotkeyConfig LoadOrDefault()
         {
             var cfg = new HotkeyConfig { DeviceIndex = 0, PanStep = 1, TiltStep = 1, ZoomStep = 10 };
-            string path = FilePath();
-            if (!File.Exists(path))
+            if (!File.Exists(ConfigFile))
                 return cfg;
 
-            foreach (string rawLine in File.ReadAllLines(path))
+            foreach (string rawLine in File.ReadAllLines(ConfigFile))
             {
                 string line = rawLine.Trim();
                 if (line.Length == 0 || line.StartsWith("#"))
@@ -280,7 +270,7 @@ namespace PTZControl
 
         public static void Save(HotkeyConfig cfg)
         {
-            string path = FilePath();
+            Directory.CreateDirectory(Dir);
             var lines = new List<string>
             {
                 "# PTZControl hotkey config - auto-generated",
@@ -289,7 +279,7 @@ namespace PTZControl
                 "TiltStep=" + cfg.TiltStep.ToString(CultureInfo.InvariantCulture),
                 "ZoomStep=" + cfg.ZoomStep.ToString(CultureInfo.InvariantCulture)
             };
-            File.WriteAllLines(path, lines);
+            File.WriteAllLines(ConfigFile, lines);
         }
     }
 
@@ -304,57 +294,133 @@ namespace PTZControl
         public static DeviceInfo[] EnumerateDevices()
         {
             var devEnum = (ICreateDevEnum)new SystemDeviceEnum();
-            Guid category = CLSID_VideoInputDeviceCategory;
-            IEnumMoniker enumMoniker;
-            int hr = devEnum.CreateClassEnumerator(ref category, out enumMoniker, 0);
-            if (hr != 0 || enumMoniker == null)
-                return new DeviceInfo[0];
-
-            var result = new List<DeviceInfo>();
-            IMoniker[] monikers = new IMoniker[1];
-            IntPtr fetched = IntPtr.Zero;
-
-            while (enumMoniker.Next(1, monikers, fetched) == 0)
+            IEnumMoniker enumMoniker = null;
+            try
             {
-                IMoniker m = monikers[0];
-                string name = "(unknown)";
+                Guid category = CLSID_VideoInputDeviceCategory;
+                int hr = devEnum.CreateClassEnumerator(ref category, out enumMoniker, 0);
+                if (hr != 0 || enumMoniker == null)
+                    return new DeviceInfo[0];
+
+                var result = new List<DeviceInfo>();
+                IMoniker[] monikers = new IMoniker[1];
+                IntPtr fetched = IntPtr.Zero;
+
+                while (enumMoniker.Next(1, monikers, fetched) == 0)
+                {
+                    result.Add(new DeviceInfo { Moniker = monikers[0], Name = GetFriendlyName(monikers[0]) });
+                }
+
+                return result.ToArray();
+            }
+            finally
+            {
+                if (enumMoniker != null && Marshal.IsComObject(enumMoniker))
+                {
+                    try { Marshal.ReleaseComObject(enumMoniker); } catch { }
+                }
+                if (Marshal.IsComObject(devEnum))
+                {
+                    try { Marshal.ReleaseComObject(devEnum); } catch { }
+                }
+            }
+        }
+
+        // Reads the device's FriendlyName from its property bag, releasing the
+        // bag explicitly so it doesn't fall to the GC finalizer (unsafe with
+        // some camera drivers - see CloseCameraControl below).
+        static string GetFriendlyName(IMoniker moniker)
+        {
+            object bagObj = null;
+            try
+            {
+                Guid propertyBagGuid = typeof(IPropertyBag).GUID;
                 try
                 {
-                    Guid propertyBagGuid = typeof(IPropertyBag).GUID;
-                    object bagObj;
-                    m.BindToStorage(null, null, ref propertyBagGuid, out bagObj);
-                    var bag = (IPropertyBag)bagObj;
-                    object val = null;
-                    bag.Read("FriendlyName", ref val, IntPtr.Zero);
-                    if (val != null) name = val.ToString();
+                    moniker.BindToStorage(null, null, ref propertyBagGuid, out bagObj);
                 }
-                catch { }
+                catch (COMException)
+                {
+                    return "(unknown)";
+                }
 
-                result.Add(new DeviceInfo { Moniker = m, Name = name });
+                var bag = bagObj as IPropertyBag;
+                if (bag == null)
+                    return "(unknown)";
+
+                object val = null;
+                int readHr = bag.Read("FriendlyName", ref val, IntPtr.Zero);
+                if (readHr != 0 || val == null)
+                    return "(unknown)";
+
+                return val.ToString();
             }
-
-            return result.ToArray();
+            finally
+            {
+                if (bagObj != null && Marshal.IsComObject(bagObj))
+                {
+                    try { Marshal.ReleaseComObject(bagObj); } catch { }
+                }
+            }
         }
 
         public static IAMCameraControl OpenCameraControl(int deviceIndex, out string deviceName)
         {
             DeviceInfo[] devices = EnumerateDevices();
-            if (deviceIndex < 0 || deviceIndex >= devices.Length)
-                throw new Exception(string.Format("Device index {0} out of range (found {1} device(s); run 'list').",
-                    deviceIndex, devices.Length));
+            try
+            {
+                if (deviceIndex < 0 || deviceIndex >= devices.Length)
+                    throw new Exception(string.Format("Device index {0} out of range (found {1} device(s); run 'list').",
+                        deviceIndex, devices.Length));
 
-            DeviceInfo dev = devices[deviceIndex];
-            deviceName = dev.Name;
+                DeviceInfo dev = devices[deviceIndex];
+                deviceName = dev.Name;
 
-            Guid iid = typeof(IBaseFilterMarker).GUID;
-            object filterObj;
-            dev.Moniker.BindToObject(null, null, ref iid, out filterObj);
+                Guid iid = typeof(IBaseFilterMarker).GUID;
+                object filterObj;
+                dev.Moniker.BindToObject(null, null, ref iid, out filterObj);
 
-            var camControl = filterObj as IAMCameraControl;
-            if (camControl == null)
-                throw new Exception(string.Format("Device '{0}' does not support IAMCameraControl (no PTZ controls).", dev.Name));
+                var camControl = filterObj as IAMCameraControl;
+                if (camControl == null)
+                {
+                    // No PTZ interface on this filter; release the filter we
+                    // just bound instead of leaking it.
+                    if (Marshal.IsComObject(filterObj))
+                    {
+                        try { Marshal.ReleaseComObject(filterObj); } catch { }
+                    }
+                    throw new Exception(string.Format("Device '{0}' does not support IAMCameraControl (no PTZ controls).", dev.Name));
+                }
 
-            return camControl;
+                // The QI above normally returns the SAME RCW that BindToObject
+                // created, so releasing filterObj here would free the object out
+                // from under camControl. Only release it when the QI produced a
+                // genuinely distinct RCW (which would otherwise leak).
+                if (!object.ReferenceEquals(filterObj, camControl) && Marshal.IsComObject(filterObj))
+                    Marshal.ReleaseComObject(filterObj);
+
+                return camControl;
+            }
+            finally
+            {
+                // Monikers have served their purpose (binding the selected
+                // device); release them all instead of leaving them to the GC.
+                ReleaseDevices(devices);
+            }
+        }
+
+        // Releases every moniker in an enumeration result. Monikers are only
+        // needed transiently (to bind a device); call this once you're done with
+        // the DeviceInfo array so they don't fall to the GC finalizer.
+        public static void ReleaseDevices(DeviceInfo[] devices)
+        {
+            foreach (DeviceInfo d in devices)
+            {
+                if (d.Moniker != null && Marshal.IsComObject(d.Moniker))
+                {
+                    try { Marshal.ReleaseComObject(d.Moniker); } catch { }
+                }
+            }
         }
 
         // Releases a COM camera control connection obtained from OpenCameraControl.
@@ -399,7 +465,12 @@ namespace PTZControl
                     continue;
                 }
                 int value; CameraControlFlags flags;
-                cc.Get(prop, out value, out flags);
+                int getHr = cc.Get(prop, out value, out flags);
+                if (getHr != 0)
+                {
+                    sb.AppendLine(string.Format("  {0,-9} read failed (hr=0x{1:X8})", prop, getHr));
+                    continue;
+                }
                 sb.AppendLine(string.Format("  {0,-9} value={1,-6} range=[{2},{3}] step={4} default={5}",
                     prop, value, min, max, step, def));
             }
@@ -427,18 +498,18 @@ namespace PTZControl
             if (rangeHr != 0)
                 throw new Exception(prop + " is not supported on this device.");
 
-            if ((prop == CameraControlProperty.Pan || prop == CameraControlProperty.Tilt) && min == max)
+            if (min == max)
             {
                 message = string.Format("{0} has no range to move in right now (at min/max zoom crop) - doing nothing.", prop);
                 return;
             }
 
-            int clamped = Clamp(value, min, max);
-            int hr = cc.Set(prop, clamped, CameraControlFlags.Manual);
+            int snapped = ClampAndSnap(value, min, max, step);
+            int hr = cc.Set(prop, snapped, CameraControlFlags.Manual);
             if (hr != 0)
                 throw new Exception(string.Format("Set failed (hr=0x{0:X8}).", hr));
 
-            message = string.Format("{0} = {1} (requested {2}, range [{3},{4}])", prop, clamped, value, min, max);
+            message = string.Format("{0} = {1} (requested {2}, range [{3},{4}])", prop, snapped, value, min, max);
         }
 
         public static void MoveRelative(int deviceIndex, CameraControlProperty prop, int delta, out string message)
@@ -468,10 +539,13 @@ namespace PTZControl
                 return;
             }
 
-            int current; CameraControlFlags flags;
-            cc.Get(prop, out current, out flags);
+            int current = ReadValue(cc, prop);
 
-            int target = Clamp(current + delta, min, max);
+            // Compute in long to avoid unchecked overflow on current + delta,
+            // clamp to the property's range, then snap to the driver's step grid.
+            long targetLong = (long)current + delta;
+            int target = ClampAndSnap(targetLong < min ? min : targetLong > max ? max : (int)targetLong, min, max, step);
+
             int hr = cc.Set(prop, target, CameraControlFlags.Manual);
             if (hr != 0)
                 throw new Exception(string.Format("Set failed (hr=0x{0:X8}).", hr));
@@ -523,18 +597,26 @@ namespace PTZControl
 
         internal static void SavePresetCore(IAMCameraControl cc, int slot, out string message)
         {
-            int pan; CameraControlFlags f;
-            cc.Get(CameraControlProperty.Pan, out pan, out f);
-            int tilt;
-            cc.Get(CameraControlProperty.Tilt, out tilt, out f);
-            int zoom;
-            cc.Get(CameraControlProperty.Zoom, out zoom, out f);
+            int pan = ReadValue(cc, CameraControlProperty.Pan);
+            int tilt = ReadValue(cc, CameraControlProperty.Tilt);
+            int zoom = ReadValue(cc, CameraControlProperty.Zoom);
 
             var presets = PresetStore.Load();
             presets[slot] = new Preset { Pan = pan, Tilt = tilt, Zoom = zoom };
             PresetStore.Save(presets);
 
             message = string.Format("Saved preset F{0}: pan={1}, tilt={2}, zoom={3}", slot, pan, tilt, zoom);
+        }
+
+        // Reads a property value, throwing on failure instead of returning a
+        // garbage 0 that would silently corrupt a saved preset.
+        static int ReadValue(IAMCameraControl cc, CameraControlProperty prop)
+        {
+            int value; CameraControlFlags flags;
+            int hr = cc.Get(prop, out value, out flags);
+            if (hr != 0)
+                throw new Exception(string.Format("Get {0} failed (hr=0x{1:X8}).", prop, hr));
+            return value;
         }
 
         public static void RecallPreset(int deviceIndex, int slot, out string message)
@@ -551,7 +633,7 @@ namespace PTZControl
             IAMCameraControl cc = OpenCameraControl(deviceIndex, out unusedName);
             try
             {
-                RecallPresetCore(cc, slot, out message);
+                RecallPresetCore(cc, p, slot, out message);
             }
             finally
             {
@@ -559,16 +641,8 @@ namespace PTZControl
             }
         }
 
-        internal static void RecallPresetCore(IAMCameraControl cc, int slot, out string message)
+        internal static void RecallPresetCore(IAMCameraControl cc, Preset p, int slot, out string message)
         {
-            var presets = PresetStore.Load();
-            Preset p;
-            if (!presets.TryGetValue(slot, out p))
-            {
-                message = string.Format("No preset saved on F{0}.", slot);
-                return;
-            }
-
             // Set zoom first so pan/tilt are applied against the crop range
             // that matches the target zoom level.
             string zMsg, pMsg, tMsg;
@@ -596,6 +670,23 @@ namespace PTZControl
             if (v < min) return min;
             if (v > max) return max;
             return v;
+        }
+
+        // Clamps to [min,max] and rounds to the nearest point on the driver's
+        // step grid (steppingDelta), anchored at the range minimum, so Set()
+        // doesn't fail with E_INVALIDARG. Rounding to nearest (rather than
+        // flooring) keeps a relative move from silently collapsing to zero when
+        // the configured step isn't an exact multiple of the driver's step.
+        public static int ClampAndSnap(int v, int min, int max, int step)
+        {
+            int clamped = Clamp(v, min, max);
+            if (step <= 1)
+                return clamped;
+            long offset = (long)clamped - min;               // >= 0, computed in long to avoid overflow
+            long rounded = ((offset + step / 2) / step) * step;
+            long snapped = min + rounded;                    // within [min, max + step)
+            if (snapped > max) snapped = max;
+            return (int)snapped;
         }
 
         public static CameraControlProperty ParseProperty(string s)
@@ -668,7 +759,14 @@ namespace PTZControl
 
         public void RecallPreset(int slot, out string message)
         {
-            Camera.RecallPresetCore(cc, slot, out message);
+            var presets = PresetStore.Load();
+            Preset p;
+            if (!presets.TryGetValue(slot, out p))
+            {
+                message = string.Format("No preset saved on F{0}.", slot);
+                return;
+            }
+            Camera.RecallPresetCore(cc, p, slot, out message);
         }
 
         public void Dispose()
@@ -704,6 +802,7 @@ namespace PTZControl
         readonly int panStep, tiltStep, zoomStep;
         readonly Dictionary<int, Action> handlers = new Dictionary<int, Action>();
         NotifyIcon trayIcon;
+        Icon ownTrayIcon; // set only when we extracted (and therefore own) the icon; SystemIcons.Application is shared and must not be disposed
         CameraSession session; // one persistent COM connection, reused for every hotkey
         int nextId = 1;
         string discardMsg; // scratch var for out params we don't need the value of
@@ -757,7 +856,9 @@ namespace PTZControl
             try
             {
                 trayIconImage = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
-                if (trayIconImage == null)
+                if (trayIconImage != null)
+                    ownTrayIcon = trayIconImage; // we own this one; dispose it on close
+                else
                     trayIconImage = SystemIcons.Application;
             }
             catch
@@ -864,6 +965,11 @@ namespace PTZControl
                 trayIcon.Visible = false;
                 trayIcon.Dispose();
             }
+            if (ownTrayIcon != null)
+            {
+                ownTrayIcon.Dispose();
+                ownTrayIcon = null;
+            }
             if (session != null)
             {
                 session.Dispose();
@@ -920,10 +1026,19 @@ namespace PTZControl
                     HotkeyConfig cfg = ConfigStore.LoadOrDefault();
                     bool changed = false;
 
-                    if (args.Length > startIdx) { cfg.DeviceIndex = int.Parse(args[startIdx]); changed = true; }
-                    if (args.Length > startIdx + 1) { cfg.PanStep = int.Parse(args[startIdx + 1]); changed = true; }
-                    if (args.Length > startIdx + 2) { cfg.TiltStep = int.Parse(args[startIdx + 2]); changed = true; }
-                    if (args.Length > startIdx + 3) { cfg.ZoomStep = int.Parse(args[startIdx + 3]); changed = true; }
+                    if (args.Length > startIdx) { cfg.DeviceIndex = ParseInt(args[startIdx]); changed = true; }
+                    if (args.Length > startIdx + 1) { cfg.PanStep = ParseInt(args[startIdx + 1]); changed = true; }
+                    if (args.Length > startIdx + 2) { cfg.TiltStep = ParseInt(args[startIdx + 2]); changed = true; }
+                    if (args.Length > startIdx + 3) { cfg.ZoomStep = ParseInt(args[startIdx + 3]); changed = true; }
+
+                    // Reject nonsensical values (negative device index, zero or
+                    // negative step sizes) rather than silently inverting or
+                    // dead-ending the hotkeys.
+                    if (cfg.DeviceIndex < 0 || cfg.PanStep < 1 || cfg.TiltStep < 1 || cfg.ZoomStep < 1)
+                    {
+                        PrintUsage();
+                        return 1;
+                    }
 
                     if (changed)
                         ConfigStore.Save(cfg);
@@ -945,7 +1060,7 @@ namespace PTZControl
 
                 if (action == "status")
                 {
-                    int devIdx = args.Length > 1 ? int.Parse(args[1]) : 0;
+                    int devIdx = args.Length > 1 ? ParseInt(args[1]) : 0;
                     Console.Write(Camera.GetStatusText(devIdx));
                     return 0;
                 }
@@ -970,11 +1085,16 @@ namespace PTZControl
                     if (args.Length < 5) { PrintUsage(); return 1; }
                     HotkeyConfig cfg = new HotkeyConfig
                     {
-                        DeviceIndex = int.Parse(args[1]),
-                        PanStep = int.Parse(args[2]),
-                        TiltStep = int.Parse(args[3]),
-                        ZoomStep = int.Parse(args[4])
+                        DeviceIndex = ParseInt(args[1]),
+                        PanStep = ParseInt(args[2]),
+                        TiltStep = ParseInt(args[3]),
+                        ZoomStep = ParseInt(args[4])
                     };
+                    if (cfg.DeviceIndex < 0 || cfg.PanStep < 1 || cfg.TiltStep < 1 || cfg.ZoomStep < 1)
+                    {
+                        PrintUsage();
+                        return 1;
+                    }
                     ConfigStore.Save(cfg);
                     Console.WriteLine(string.Format(
                         "Saved: deviceIndex={0}, panStep={1}, tiltStep={2}, zoomStep={3}",
@@ -985,8 +1105,9 @@ namespace PTZControl
                 if (action == "presetsave" || action == "presetload")
                 {
                     if (args.Length < 2) { PrintUsage(); return 1; }
-                    int slot = int.Parse(args[1]);
-                    int devIdx = args.Length > 2 ? int.Parse(args[2]) : 0;
+                    int slot = ParseInt(args[1]);
+                    if (slot < 1 || slot > 8) { PrintUsage(); return 1; }
+                    int devIdx = args.Length > 2 ? ParseInt(args[2]) : 0;
                     string message;
 
                     if (action == "presetsave")
@@ -1006,15 +1127,15 @@ namespace PTZControl
 
                     if (action == "reset")
                     {
-                        int devIdx = args.Length > 2 ? int.Parse(args[2]) : 0;
+                        int devIdx = args.Length > 2 ? ParseInt(args[2]) : 0;
                         Camera.ResetProperty(devIdx, prop, out message);
                         Console.WriteLine(message);
                         return 0;
                     }
 
                     if (args.Length < 3) { PrintUsage(); return 1; }
-                    int value = int.Parse(args[2]);
-                    int deviceIndex = args.Length > 3 ? int.Parse(args[3]) : 0;
+                    int value = ParseInt(args[2]);
+                    int deviceIndex = args.Length > 3 ? ParseInt(args[3]) : 0;
 
                     if (action == "set")
                         Camera.SetAbsolute(deviceIndex, prop, value, out message);
@@ -1035,16 +1156,31 @@ namespace PTZControl
             }
         }
 
+        // Parses a CLI integer with the invariant culture so machine-generated
+        // and user-supplied values parse identically regardless of the user's
+        // locale (matches how ConfigStore writes its values).
+        static int ParseInt(string s)
+        {
+            return int.Parse(s, NumberStyles.Integer, CultureInfo.InvariantCulture);
+        }
+
         static IEnumerable<string> ListLines()
         {
             DeviceInfo[] devices = Camera.EnumerateDevices();
-            if (devices.Length == 0)
+            try
             {
-                yield return "No video capture devices found.";
-                yield break;
+                if (devices.Length == 0)
+                {
+                    yield return "No video capture devices found.";
+                    yield break;
+                }
+                for (int i = 0; i < devices.Length; i++)
+                    yield return i + ": " + devices[i].Name;
             }
-            for (int i = 0; i < devices.Length; i++)
-                yield return i + ": " + devices[i].Name;
+            finally
+            {
+                Camera.ReleaseDevices(devices);
+            }
         }
 
         static void PrintUsage()
