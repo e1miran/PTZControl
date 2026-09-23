@@ -1005,10 +1005,19 @@ namespace PTZControl
                     HotkeyConfig cfg = ConfigStore.LoadOrDefault();
                     bool changed = false;
 
-                    if (args.Length > startIdx) { cfg.DeviceIndex = int.Parse(args[startIdx]); changed = true; }
-                    if (args.Length > startIdx + 1) { cfg.PanStep = int.Parse(args[startIdx + 1]); changed = true; }
-                    if (args.Length > startIdx + 2) { cfg.TiltStep = int.Parse(args[startIdx + 2]); changed = true; }
-                    if (args.Length > startIdx + 3) { cfg.ZoomStep = int.Parse(args[startIdx + 3]); changed = true; }
+                    if (args.Length > startIdx) { cfg.DeviceIndex = ParseInt(args[startIdx]); changed = true; }
+                    if (args.Length > startIdx + 1) { cfg.PanStep = ParseInt(args[startIdx + 1]); changed = true; }
+                    if (args.Length > startIdx + 2) { cfg.TiltStep = ParseInt(args[startIdx + 2]); changed = true; }
+                    if (args.Length > startIdx + 3) { cfg.ZoomStep = ParseInt(args[startIdx + 3]); changed = true; }
+
+                    // Reject nonsensical values (negative device index, zero or
+                    // negative step sizes) rather than silently inverting or
+                    // dead-ending the hotkeys.
+                    if (cfg.DeviceIndex < 0 || cfg.PanStep < 1 || cfg.TiltStep < 1 || cfg.ZoomStep < 1)
+                    {
+                        PrintUsage();
+                        return 1;
+                    }
 
                     if (changed)
                         ConfigStore.Save(cfg);
@@ -1030,7 +1039,7 @@ namespace PTZControl
 
                 if (action == "status")
                 {
-                    int devIdx = args.Length > 1 ? int.Parse(args[1]) : 0;
+                    int devIdx = args.Length > 1 ? ParseInt(args[1]) : 0;
                     Console.Write(Camera.GetStatusText(devIdx));
                     return 0;
                 }
@@ -1055,11 +1064,16 @@ namespace PTZControl
                     if (args.Length < 5) { PrintUsage(); return 1; }
                     HotkeyConfig cfg = new HotkeyConfig
                     {
-                        DeviceIndex = int.Parse(args[1]),
-                        PanStep = int.Parse(args[2]),
-                        TiltStep = int.Parse(args[3]),
-                        ZoomStep = int.Parse(args[4])
+                        DeviceIndex = ParseInt(args[1]),
+                        PanStep = ParseInt(args[2]),
+                        TiltStep = ParseInt(args[3]),
+                        ZoomStep = ParseInt(args[4])
                     };
+                    if (cfg.DeviceIndex < 0 || cfg.PanStep < 1 || cfg.TiltStep < 1 || cfg.ZoomStep < 1)
+                    {
+                        PrintUsage();
+                        return 1;
+                    }
                     ConfigStore.Save(cfg);
                     Console.WriteLine(string.Format(
                         "Saved: deviceIndex={0}, panStep={1}, tiltStep={2}, zoomStep={3}",
@@ -1070,8 +1084,9 @@ namespace PTZControl
                 if (action == "presetsave" || action == "presetload")
                 {
                     if (args.Length < 2) { PrintUsage(); return 1; }
-                    int slot = int.Parse(args[1]);
-                    int devIdx = args.Length > 2 ? int.Parse(args[2]) : 0;
+                    int slot = ParseInt(args[1]);
+                    if (slot < 1 || slot > 8) { PrintUsage(); return 1; }
+                    int devIdx = args.Length > 2 ? ParseInt(args[2]) : 0;
                     string message;
 
                     if (action == "presetsave")
@@ -1091,15 +1106,15 @@ namespace PTZControl
 
                     if (action == "reset")
                     {
-                        int devIdx = args.Length > 2 ? int.Parse(args[2]) : 0;
+                        int devIdx = args.Length > 2 ? ParseInt(args[2]) : 0;
                         Camera.ResetProperty(devIdx, prop, out message);
                         Console.WriteLine(message);
                         return 0;
                     }
 
                     if (args.Length < 3) { PrintUsage(); return 1; }
-                    int value = int.Parse(args[2]);
-                    int deviceIndex = args.Length > 3 ? int.Parse(args[3]) : 0;
+                    int value = ParseInt(args[2]);
+                    int deviceIndex = args.Length > 3 ? ParseInt(args[3]) : 0;
 
                     if (action == "set")
                         Camera.SetAbsolute(deviceIndex, prop, value, out message);
@@ -1118,6 +1133,14 @@ namespace PTZControl
                 Console.Error.WriteLine("Error: " + ex.Message);
                 return 2;
             }
+        }
+
+        // Parses a CLI integer with the invariant culture so machine-generated
+        // and user-supplied values parse identically regardless of the user's
+        // locale (matches how ConfigStore writes its values).
+        static int ParseInt(string s)
+        {
+            return int.Parse(s, NumberStyles.Integer, CultureInfo.InvariantCulture);
         }
 
         static IEnumerable<string> ListLines()
