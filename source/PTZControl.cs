@@ -17,12 +17,15 @@
 //        PTZControl.exe presets   (lists saved presets)
 //        PTZControl.exe config    (shows the saved device index / step sizes)
 //        PTZControl.exe setsteps <deviceIndex> <panStep> <tiltStep> <zoomStep>
+//        PTZControl.exe bindings  (shows the hotkey file path, each binding, and
+//                                  whether each key is free or already in use)
 //
 //   2) Background hotkey daemon:
 //        PTZControl.exe hotkeys [deviceIndex] [panStep] [tiltStep] [zoomStep]
 //        (or just run PTZControl.exe with no arguments at all)
 //
-//      Registers global hotkeys, sits in the system tray, and reacts to:
+//      Registers global hotkeys, sits in the system tray, and reacts to the
+//      keys listed in hotkeys.ini (created with these defaults on first run):
 //        Ctrl+Alt+Left/Right         pan
 //        Ctrl+Alt+Up/Down            tilt
 //        Ctrl+Alt+PageUp/PageDown    zoom
@@ -30,25 +33,32 @@
 //        Ctrl+Alt+End                balloon tip with current status
 //        F1 - F8                     recall camera-scene preset 1-8 (no notification)
 //        Ctrl+Alt+Shift+F1 - F8      save current pan/tilt/zoom as preset 1-8
-//      Right-click the tray icon to Exit.
+//      Right-click the tray icon for Status, List presets, Edit hotkeys file,
+//      Reload hotkeys, and Exit.
 //      If pan or tilt currently has zero range (stuck at min/max zoom crop),
 //      the corresponding hotkey simply does nothing - no automatic zoom
 //      adjustment happens. Use 'status' to see each property's live range.
 //
-//      NOTE: F1-F8 are registered as plain (unmodified) global hotkeys for
-//      recall, per the "camera scene on a function key" request. If those
-//      keys are already used for something else on your PC (media controls,
-//      another app's global hotkeys, a laptop's Fn-lock behavior), those
-//      presses may not reach whichever app you meant to control instead.
-//      If that happens, change VK_F1..VK_F8 registration below to use a
-//      modifier (e.g. add MOD_ALT) instead of 0.
+//      CHANGING THE KEYS (no recompiling needed):
+//        Edit %APPDATA%\PTZControl\hotkeys.ini (tray menu -> Edit hotkeys file),
+//        then choose "Reload hotkeys" from the tray menu. Each line is
+//            ActionName=Modifier+Modifier+Key        e.g.  PanLeft=Ctrl+Shift+Left
+//        Modifiers: Ctrl, Alt, Shift, Win. Keys are .NET key names (Left, PageUp,
+//        Home, F1-F24, A-Z, 0-9, NumPad0, Add, ...). Leave the value blank (or
+//        'none') to disable an action. Any key that can't be assigned - already
+//        taken by another program, reserved by Windows, misspelled, or duplicated
+//        within the file - is listed in a message box when hotkeys are loaded.
+//        Actions: PanLeft PanRight TiltUp TiltDown ZoomIn ZoomOut Reset Status
+//                 Recall1..Recall8 Save1..Save8
+//        Lines you delete fall back to the default binding for that action.
 //
 //      Any deviceIndex/panStep/tiltStep/zoomStep given on the command line
 //      (to 'hotkeys' or 'setsteps') is saved and becomes the default the next
 //      time you launch with no arguments - so you only need to specify your
-//      preferred step sizes once. Presets and this config are saved to:
+//      preferred step sizes once. Presets, step sizes, and hotkeys are saved to:
 //        %APPDATA%\PTZControl\presets.ini
 //        %APPDATA%\PTZControl\config.ini
+//        %APPDATA%\PTZControl\hotkeys.ini
 //      so they persist across restarts of this program and reboots.
 //
 // Compile (csc ships with .NET Framework — no extra install needed):
@@ -290,6 +300,205 @@ namespace PTZControl
                 "ZoomStep=" + cfg.ZoomStep.ToString(CultureInfo.InvariantCulture)
             };
             File.WriteAllLines(path, lines);
+        }
+    }
+
+    #endregion
+
+    #region Hotkey bindings (user-editable hotkeys.ini)
+
+    internal static class NativeMethods
+    {
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool UnregisterHotKey(IntPtr hWnd, int id);
+    }
+
+    // Reads/writes %APPDATA%\PTZControl\hotkeys.ini and turns text like
+    // "Ctrl+Alt+Left" into the modifier flags + virtual-key code that
+    // RegisterHotKey needs. The file is created with the default bindings the
+    // first time it's needed, so there's always something to edit.
+    internal static class HotkeyBindings
+    {
+        public const uint MOD_ALT = 0x1;
+        public const uint MOD_CONTROL = 0x2;
+        public const uint MOD_SHIFT = 0x4;
+        public const uint MOD_WIN = 0x8;
+
+        public static string FilePath()
+        {
+            string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "PTZControl");
+            Directory.CreateDirectory(dir);
+            return Path.Combine(dir, "hotkeys.ini");
+        }
+
+        // Action names and their built-in default keys, in the order they're
+        // written to a newly created hotkeys.ini.
+        public static List<KeyValuePair<string, string>> Defaults()
+        {
+            var list = new List<KeyValuePair<string, string>>();
+            list.Add(new KeyValuePair<string, string>("PanLeft", "Ctrl+Alt+Left"));
+            list.Add(new KeyValuePair<string, string>("PanRight", "Ctrl+Alt+Right"));
+            list.Add(new KeyValuePair<string, string>("TiltUp", "Ctrl+Alt+Up"));
+            list.Add(new KeyValuePair<string, string>("TiltDown", "Ctrl+Alt+Down"));
+            list.Add(new KeyValuePair<string, string>("ZoomIn", "Ctrl+Alt+PageUp"));
+            list.Add(new KeyValuePair<string, string>("ZoomOut", "Ctrl+Alt+PageDown"));
+            list.Add(new KeyValuePair<string, string>("Reset", "Ctrl+Alt+Home"));
+            list.Add(new KeyValuePair<string, string>("Status", "Ctrl+Alt+End"));
+            for (int i = 1; i <= 8; i++)
+                list.Add(new KeyValuePair<string, string>("Recall" + i, "F" + i));
+            for (int i = 1; i <= 8; i++)
+                list.Add(new KeyValuePair<string, string>("Save" + i, "Ctrl+Alt+Shift+F" + i));
+            return list;
+        }
+
+        public static void EnsureFileExists()
+        {
+            string path = FilePath();
+            if (File.Exists(path))
+                return;
+
+            var lines = new List<string>();
+            lines.Add("# PTZControl hotkey bindings.");
+            lines.Add("# Edit, save, then choose 'Reload hotkeys' from the PTZControl tray menu.");
+            lines.Add("#");
+            lines.Add("# Format:   ActionName=Modifier+Modifier+Key");
+            lines.Add("# Modifiers: Ctrl, Alt, Shift, Win");
+            lines.Add("# Keys: Left Right Up Down PageUp PageDown Home End Insert Delete Space Tab");
+            lines.Add("#       F1-F24, A-Z, 0-9, NumPad0-NumPad9, Add, Subtract, Multiply, Divide, ...");
+            lines.Add("#       (any System.Windows.Forms.Keys name works; for the + key use Oemplus)");
+            lines.Add("# Leave the value blank (or 'none') to disable an action.");
+            lines.Add("# A deleted line falls back to the default for that action.");
+            lines.Add("# Note: F12 is reserved by Windows for debuggers; Ctrl+Alt+Del and Win+L can't be used.");
+            lines.Add("");
+            foreach (var kv in Defaults())
+                lines.Add(kv.Key + "=" + kv.Value);
+            File.WriteAllLines(path, lines);
+        }
+
+        public static Dictionary<string, string> DefaultsAsDictionary()
+        {
+            var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var kv in Defaults())
+                result[kv.Key] = kv.Value;
+            return result;
+        }
+
+        // Defaults overlaid with whatever is in the file. Unknown action names
+        // are kept in the result so callers can warn about typos.
+        public static Dictionary<string, string> Load()
+        {
+            EnsureFileExists();
+            var result = DefaultsAsDictionary();
+
+            foreach (string rawLine in File.ReadAllLines(FilePath()))
+            {
+                string line = rawLine.Trim();
+                if (line.Length == 0 || line.StartsWith("#") || line.StartsWith(";"))
+                    continue;
+
+                int eq = line.IndexOf('=');
+                if (eq <= 0)
+                    continue;
+
+                string name = line.Substring(0, eq).Trim();
+                string value = line.Substring(eq + 1).Trim();
+                result[name] = value;
+            }
+            return result;
+        }
+
+        public static bool IsDisabled(string text)
+        {
+            if (text == null)
+                return true;
+            string t = text.Trim().ToLowerInvariant();
+            return t.Length == 0 || t == "none" || t == "off" || t == "disabled";
+        }
+
+        // "Ctrl+Alt+Left" -> modifiers = MOD_CONTROL|MOD_ALT, vk = VK_LEFT.
+        public static bool TryParse(string text, out uint modifiers, out uint vk, out string error)
+        {
+            modifiers = 0;
+            vk = 0;
+            error = null;
+
+            string[] parts = text.Split('+');
+            bool haveKey = false;
+
+            for (int i = 0; i < parts.Length; i++)
+            {
+                string tok = parts[i].Trim();
+                if (tok.Length == 0)
+                {
+                    error = "empty key name (for the + key itself use 'Oemplus' or 'Add')";
+                    return false;
+                }
+
+                string lower = tok.ToLowerInvariant();
+                if (lower == "ctrl" || lower == "control") { modifiers |= MOD_CONTROL; continue; }
+                if (lower == "alt") { modifiers |= MOD_ALT; continue; }
+                if (lower == "shift") { modifiers |= MOD_SHIFT; continue; }
+                if (lower == "win" || lower == "windows") { modifiers |= MOD_WIN; continue; }
+
+                if (i != parts.Length - 1)
+                {
+                    error = "'" + tok + "' is not a modifier (Ctrl, Alt, Shift, Win) - the key must come last";
+                    return false;
+                }
+
+                Keys key;
+                if (!TryParseKey(tok, out key))
+                {
+                    error = "unknown key '" + tok + "'";
+                    return false;
+                }
+                vk = (uint)(int)key;
+                haveKey = true;
+            }
+
+            if (!haveKey)
+            {
+                error = "no key given (only modifiers)";
+                return false;
+            }
+            return true;
+        }
+
+        static bool TryParseKey(string token, out Keys key)
+        {
+            key = Keys.None;
+
+            // A bare digit means the number-row key (Keys.D0..D9), not the raw
+            // enum value (which would be a mouse button for 1, 2, 4...).
+            string name = token;
+            if (name.Length == 1 && name[0] >= '0' && name[0] <= '9')
+                name = "D" + name;
+
+            foreach (string n in Enum.GetNames(typeof(Keys)))
+            {
+                if (!string.Equals(n, name, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                Keys k = (Keys)Enum.Parse(typeof(Keys), n);
+
+                // Reject modifier flags (Keys.Control etc.), mouse buttons, and
+                // the modifier keys themselves - none make sense as the main key.
+                if (k == Keys.None || (k & Keys.KeyCode) != k || (int)k < 8)
+                    return false;
+                if (k == Keys.ControlKey || k == Keys.ShiftKey || k == Keys.Menu ||
+                    k == Keys.LControlKey || k == Keys.RControlKey ||
+                    k == Keys.LShiftKey || k == Keys.RShiftKey ||
+                    k == Keys.LMenu || k == Keys.RMenu ||
+                    k == Keys.LWin || k == Keys.RWin)
+                    return false;
+
+                key = k;
+                return true;
+            }
+            return false;
         }
     }
 
@@ -684,21 +893,7 @@ namespace PTZControl
 
     internal class HotkeyForm : Form
     {
-        [DllImport("user32.dll", SetLastError = true)]
-        static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
-
-        [DllImport("user32.dll", SetLastError = true)]
-        static extern bool UnregisterHotKey(IntPtr hWnd, int id);
-
         const int WM_HOTKEY = 0x0312;
-        const uint MOD_ALT = 0x1;
-        const uint MOD_CONTROL = 0x2;
-        const uint MOD_SHIFT = 0x4;
-
-        const uint VK_LEFT = 0x25, VK_UP = 0x26, VK_RIGHT = 0x27, VK_DOWN = 0x28;
-        const uint VK_PRIOR = 0x21, VK_NEXT = 0x22;   // PageUp / PageDown
-        const uint VK_HOME = 0x24, VK_END = 0x23;
-        const uint VK_F1 = 0x70;                      // VK_F1..VK_F8 are contiguous
 
         readonly int deviceIndex;
         readonly int panStep, tiltStep, zoomStep;
@@ -748,6 +943,10 @@ namespace PTZControl
             menu.Items.Add("Status", null, (s, e) => ShowStatus());
             menu.Items.Add("List presets", null, (s, e) =>
                 trayIcon.ShowBalloonTip(4000, "PTZ Presets", Camera.ListPresetsText(), ToolTipIcon.Info));
+            menu.Items.Add(new ToolStripSeparator());
+            menu.Items.Add("Edit hotkeys file...", null, (s, e) => OpenBindingsFile());
+            menu.Items.Add("Reload hotkeys", null, (s, e) => ReloadHotkeys());
+            menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("Exit", null, (s, e) => Application.Exit());
 
             // Use the icon baked into this exe (via the /win32icon compile flag)
@@ -769,55 +968,151 @@ namespace PTZControl
             {
                 Icon = trayIconImage,
                 Visible = true,
-                Text = "PTZ Control (arrows=pan/tilt, PgUp/PgDn=zoom, F1-F8=presets)",
+                Text = "PTZ Control",   // tooltip is capped at 63 chars; keys are user-configurable now
                 ContextMenuStrip = menu
             };
             trayIcon.DoubleClick += (s, e) => ShowStatus();
         }
 
-        void Add(uint modifiers, uint vk, Action action)
+        // Every action the daemon can perform, by the name used in hotkeys.ini.
+        List<KeyValuePair<string, Action>> BuildActions()
         {
-            int id = nextId++;
-            if (RegisterHotKey(this.Handle, id, modifiers, vk))
-                handlers[id] = action;
-            else
-                if (trayIcon != null)
-                    trayIcon.ShowBalloonTip(3000, "PTZ Control", "Failed to register a hotkey (already in use?)", ToolTipIcon.Warning);
-        }
+            var list = new List<KeyValuePair<string, Action>>();
 
-        void RegisterAll()
-        {
-            uint mods = MOD_CONTROL | MOD_ALT;
-
-            Add(mods, VK_LEFT, () => Do(() => session.MoveRelative(CameraControlProperty.Pan, -panStep, out discardMsg)));
-            Add(mods, VK_RIGHT, () => Do(() => session.MoveRelative(CameraControlProperty.Pan, panStep, out discardMsg)));
-            Add(mods, VK_UP, () => Do(() => session.MoveRelative(CameraControlProperty.Tilt, tiltStep, out discardMsg)));
-            Add(mods, VK_DOWN, () => Do(() => session.MoveRelative(CameraControlProperty.Tilt, -tiltStep, out discardMsg)));
-            Add(mods, VK_PRIOR, () => Do(() => session.MoveRelative(CameraControlProperty.Zoom, zoomStep, out discardMsg)));
-            Add(mods, VK_NEXT, () => Do(() => session.MoveRelative(CameraControlProperty.Zoom, -zoomStep, out discardMsg)));
-            Add(mods, VK_HOME, () => Do(() =>
+            list.Add(Act("PanLeft", () => Do(() => session.MoveRelative(CameraControlProperty.Pan, -panStep, out discardMsg))));
+            list.Add(Act("PanRight", () => Do(() => session.MoveRelative(CameraControlProperty.Pan, panStep, out discardMsg))));
+            list.Add(Act("TiltUp", () => Do(() => session.MoveRelative(CameraControlProperty.Tilt, tiltStep, out discardMsg))));
+            list.Add(Act("TiltDown", () => Do(() => session.MoveRelative(CameraControlProperty.Tilt, -tiltStep, out discardMsg))));
+            list.Add(Act("ZoomIn", () => Do(() => session.MoveRelative(CameraControlProperty.Zoom, zoomStep, out discardMsg))));
+            list.Add(Act("ZoomOut", () => Do(() => session.MoveRelative(CameraControlProperty.Zoom, -zoomStep, out discardMsg))));
+            list.Add(Act("Reset", () => Do(() =>
             {
                 session.ResetProperty(CameraControlProperty.Zoom, out discardMsg);
                 session.ResetProperty(CameraControlProperty.Pan, out discardMsg);
                 session.ResetProperty(CameraControlProperty.Tilt, out discardMsg);
                 trayIcon.ShowBalloonTip(1500, "PTZ Control", "Pan/Tilt/Zoom reset to defaults", ToolTipIcon.Info);
-            }));
-            Add(mods, VK_END, () => ShowStatus());
+            })));
+            list.Add(Act("Status", () => ShowStatus()));
 
-            // F1-F8: plain key recalls a preset, Ctrl+Alt+Shift+<key> saves one.
+            // Recall1..8: recall a preset silently. Save1..8: save the current
+            // pan/tilt/zoom into that slot (with a confirmation balloon).
             for (int i = 1; i <= 8; i++)
             {
                 int slot = i; // capture per-iteration value
-                uint vk = VK_F1 + (uint)(slot - 1);
-
-                Add(0, vk, () => Do(() => session.RecallPreset(slot, out discardMsg)));
-
-                Add(MOD_CONTROL | MOD_ALT | MOD_SHIFT, vk, () => Do(() =>
+                list.Add(Act("Recall" + slot, () => Do(() => session.RecallPreset(slot, out discardMsg))));
+                list.Add(Act("Save" + slot, () => Do(() =>
                 {
                     string msg;
                     session.SavePreset(slot, out msg);
                     trayIcon.ShowBalloonTip(1200, "PTZ Control", msg, ToolTipIcon.Info);
-                }));
+                })));
+            }
+            return list;
+        }
+
+        static KeyValuePair<string, Action> Act(string name, Action action)
+        {
+            return new KeyValuePair<string, Action>(name, action);
+        }
+
+        // Registers every action using the keys in hotkeys.ini. Anything that
+        // can't be registered (typo, unknown key, duplicate, or already taken
+        // by another program) is collected and shown in one message box.
+        // Returns the number of problems found.
+        int RegisterAll()
+        {
+            var problems = new List<string>();
+
+            Dictionary<string, string> bindings;
+            try
+            {
+                bindings = HotkeyBindings.Load();
+            }
+            catch (Exception ex)
+            {
+                problems.Add("Could not read " + HotkeyBindings.FilePath() + " (" + ex.Message + ") - using default keys.");
+                bindings = HotkeyBindings.DefaultsAsDictionary();
+            }
+
+            var known = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+            var taken = new Dictionary<ulong, string>(); // modifiers+vk -> action that owns it
+
+            foreach (KeyValuePair<string, Action> kv in BuildActions())
+            {
+                known[kv.Key] = true;
+
+                string text;
+                if (!bindings.TryGetValue(kv.Key, out text) || HotkeyBindings.IsDisabled(text))
+                    continue;
+
+                uint mods, vk;
+                string error;
+                if (!HotkeyBindings.TryParse(text, out mods, out vk, out error))
+                {
+                    problems.Add(kv.Key + "=" + text + "  -  " + error);
+                    continue;
+                }
+
+                ulong combo = ((ulong)mods << 32) | vk;
+                string owner;
+                if (taken.TryGetValue(combo, out owner))
+                {
+                    problems.Add(kv.Key + "=" + text + "  -  same key as " + owner);
+                    continue;
+                }
+
+                int id = nextId++;
+                if (NativeMethods.RegisterHotKey(this.Handle, id, mods, vk))
+                {
+                    handlers[id] = kv.Value;
+                    taken[combo] = kv.Key;
+                }
+                else
+                {
+                    problems.Add(kv.Key + "=" + text + "  -  already in use by another program (or reserved by Windows)");
+                }
+            }
+
+            foreach (string name in bindings.Keys)
+            {
+                if (!known.ContainsKey(name))
+                    problems.Add("Unknown action name '" + name + "' - check the spelling");
+            }
+
+            if (problems.Count > 0)
+            {
+                MessageBox.Show(
+                    "Some hotkeys could not be assigned:\n\n" + string.Join("\n", problems.ToArray()) +
+                    "\n\nEdit " + HotkeyBindings.FilePath() + " and choose \"Reload hotkeys\" from the tray menu.",
+                    "PTZ Control", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+            return problems.Count;
+        }
+
+        void UnregisterAllHotkeys()
+        {
+            foreach (int id in handlers.Keys)
+                NativeMethods.UnregisterHotKey(this.Handle, id);
+            handlers.Clear();
+        }
+
+        void ReloadHotkeys()
+        {
+            UnregisterAllHotkeys();
+            if (RegisterAll() == 0)
+                trayIcon.ShowBalloonTip(1500, "PTZ Control", "Hotkeys reloaded", ToolTipIcon.Info);
+        }
+
+        void OpenBindingsFile()
+        {
+            try
+            {
+                HotkeyBindings.EnsureFileExists();
+                System.Diagnostics.Process.Start("notepad.exe", "\"" + HotkeyBindings.FilePath() + "\"");
+            }
+            catch (Exception ex)
+            {
+                trayIcon.ShowBalloonTip(3000, "PTZ Control error", ex.Message, ToolTipIcon.Error);
             }
         }
 
@@ -857,8 +1152,7 @@ namespace PTZControl
 
         protected override void OnFormClosed(FormClosedEventArgs e)
         {
-            foreach (int id in handlers.Keys)
-                UnregisterHotKey(this.Handle, id);
+            UnregisterAllHotkeys();
             if (trayIcon != null)
             {
                 trayIcon.Visible = false;
@@ -965,6 +1259,32 @@ namespace PTZControl
                     return 0;
                 }
 
+                if (action == "bindings")
+                {
+                    Console.WriteLine("File: " + HotkeyBindings.FilePath());
+                    Console.WriteLine("(If PTZControl is already running in the tray, its own keys will show as IN USE - exit it first.)");
+                    Console.WriteLine();
+
+                    Dictionary<string, string> bindings = HotkeyBindings.Load();
+                    var known = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+                    var taken = new Dictionary<ulong, string>();
+
+                    foreach (KeyValuePair<string, string> d in HotkeyBindings.Defaults())
+                    {
+                        known[d.Key] = true;
+                        string text = bindings[d.Key]; // Load() always includes every default action
+                        string shown = HotkeyBindings.IsDisabled(text) ? "(disabled)" : text;
+                        Console.WriteLine(string.Format("  {0,-10} {1,-24} {2}", d.Key, shown, CheckBinding(d.Key, text, taken)));
+                    }
+
+                    foreach (string name in bindings.Keys)
+                    {
+                        if (!known.ContainsKey(name))
+                            Console.WriteLine("  Unknown action name '" + name + "' - check the spelling");
+                    }
+                    return 0;
+                }
+
                 if (action == "setsteps")
                 {
                     if (args.Length < 5) { PrintUsage(); return 1; }
@@ -1035,6 +1355,33 @@ namespace PTZControl
             }
         }
 
+        // Reports whether a binding is usable: free, invalid, duplicated within
+        // the file, or already owned by another program. The "in use" test
+        // registers the key against this thread and immediately releases it.
+        static string CheckBinding(string actionName, string text, Dictionary<ulong, string> taken)
+        {
+            if (HotkeyBindings.IsDisabled(text))
+                return "";
+
+            uint mods, vk;
+            string error;
+            if (!HotkeyBindings.TryParse(text, out mods, out vk, out error))
+                return "INVALID: " + error;
+
+            ulong combo = ((ulong)mods << 32) | vk;
+            string owner;
+            if (taken.TryGetValue(combo, out owner))
+                return "DUPLICATE of " + owner;
+
+            const int testId = 0x5A5A;
+            if (!NativeMethods.RegisterHotKey(IntPtr.Zero, testId, mods, vk))
+                return "IN USE by another program (or reserved by Windows)";
+            NativeMethods.UnregisterHotKey(IntPtr.Zero, testId);
+
+            taken[combo] = actionName;
+            return "free";
+        }
+
         static IEnumerable<string> ListLines()
         {
             DeviceInfo[] devices = Camera.EnumerateDevices();
@@ -1060,6 +1407,7 @@ namespace PTZControl
             Console.WriteLine("  PTZControl.exe presets");
             Console.WriteLine("  PTZControl.exe config");
             Console.WriteLine("  PTZControl.exe setsteps <deviceIndex> <panStep> <tiltStep> <zoomStep>");
+            Console.WriteLine("  PTZControl.exe bindings");
             Console.WriteLine("  PTZControl.exe hotkeys [deviceIndex] [panStep] [tiltStep] [zoomStep]");
             Console.WriteLine("  PTZControl.exe                                    (uses last-saved config, or defaults)");
         }
